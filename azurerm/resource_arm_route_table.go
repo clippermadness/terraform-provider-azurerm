@@ -1,13 +1,16 @@
 package azurerm
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2018-04-01/network"
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/helper/validation"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/helpers/response"
+	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/helpers/tf"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/utils"
 )
 
@@ -15,13 +18,17 @@ var routeTableResourceName = "azurerm_route_table"
 
 func resourceArmRouteTable() *schema.Resource {
 	return &schema.Resource{
-		Create: resourceArmRouteTableCreate,
+		Create: resourceArmRouteTableCreateUpdate,
 		Read:   resourceArmRouteTableRead,
-		Update: resourceArmRouteTableCreate,
+		Update: resourceArmRouteTableCreateUpdate,
 		Delete: resourceArmRouteTableDelete,
-
 		Importer: &schema.ResourceImporter{
 			State: schema.ImportStatePassthrough,
+		},
+		Timeouts: &schema.ResourceTimeout{
+			Create: schema.DefaultTimeout(time.Minute * 30),
+			Update: schema.DefaultTimeout(time.Minute * 30),
+			Delete: schema.DefaultTimeout(time.Minute * 30),
 		},
 
 		Schema: map[string]*schema.Schema{
@@ -95,15 +102,30 @@ func resourceArmRouteTable() *schema.Resource {
 	}
 }
 
-func resourceArmRouteTableCreate(d *schema.ResourceData, meta interface{}) error {
+func resourceArmRouteTableCreateUpdate(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*ArmClient).routeTablesClient
 	ctx := meta.(*ArmClient).StopContext
 
 	log.Printf("[INFO] preparing arguments for AzureRM Route Table creation.")
 
 	name := d.Get("name").(string)
-	location := azureRMNormalizeLocation(d.Get("location").(string))
 	resGroup := d.Get("resource_group_name").(string)
+
+	if d.IsNewResource() {
+		// first check if there's one in this subscription requiring import
+		resp, err := client.Get(ctx, resGroup, name, "")
+		if err != nil {
+			if !utils.ResponseWasNotFound(resp.Response) {
+				return fmt.Errorf("Error checking for the existence of Route Table %q (Resource Group %q): %+v", name, resGroup, err)
+			}
+		}
+
+		if resp.ID != nil {
+			return tf.ImportAsExistsError("azurerm_route_table", *resp.ID)
+		}
+	}
+
+	location := azureRMNormalizeLocation(d.Get("location").(string))
 	tags := d.Get("tags").(map[string]interface{})
 
 	routes, err := expandRouteTableRoutes(d)
@@ -126,7 +148,9 @@ func resourceArmRouteTableCreate(d *schema.ResourceData, meta interface{}) error
 		return fmt.Errorf("Error Creating/Updating Route Table %q (Resource Group %q): %+v", name, resGroup, err)
 	}
 
-	err = future.WaitForCompletionRef(ctx, client.Client)
+	waitCtx, cancel := context.WithTimeout(ctx, d.Timeout(tf.TimeoutForCreateUpdate(d)))
+	defer cancel()
+	err = future.WaitForCompletionRef(waitCtx, client.Client)
 	if err != nil {
 		return fmt.Errorf("Error waiting for completion of Route Table %q (Resource Group %q): %+v", name, resGroup, err)
 	}
@@ -204,7 +228,9 @@ func resourceArmRouteTableDelete(d *schema.ResourceData, meta interface{}) error
 		}
 	}
 
-	err = future.WaitForCompletionRef(ctx, client.Client)
+	waitCtx, cancel := context.WithTimeout(ctx, d.Timeout(schema.TimeoutDelete))
+	defer cancel()
+	err = future.WaitForCompletionRef(waitCtx, client.Client)
 	if err != nil {
 		return fmt.Errorf("Error waiting for deletion of Route Table %q (Resource Group %q): %+v", name, resGroup, err)
 	}
